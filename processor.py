@@ -1,14 +1,16 @@
 import argparse
 import logging
 import cv2
+import numpy as np
 import torch
+import shutil
 from pathlib import Path
 from tqdm.auto import tqdm
 
 from doclayout_yolo import YOLOv10
 
 # Default constants
-MODEL_CHECKPOINT = "checkpoint/doclayout_yolo_docstructbench_imgsz1024.pt"
+MODEL_CHECKPOINT = "checkpoint/yolo11_x.pt"
 DEFAULT_DATA_DIR = "data"
 DEFAULT_OUTPUT_DIR = "output"
 
@@ -23,7 +25,7 @@ def setup_logger(level: int = logging.INFO) -> None:
 def get_device(use_cuda: bool = True) -> torch.device:
     """Select CPU or CUDA device."""
     if use_cuda and torch.cuda.is_available():
-        return torch.device('cuda')
+        return torch.device('cuda:2')
     return torch.device('cpu')
 
 
@@ -46,11 +48,53 @@ def find_image_paths(data_dir: Path, exts: list[str]) -> list[Path]:
     return image_paths
 
 
+def divider(
+    img: np.ndarray,
+    crop_frac: float = 0.05,    # how far left/right of image‐center to search
+    gutter_frac: float = 0.005,  # gutter width as fraction of image width
+    blur_ksize: int = 5        # optional smoothing to reduce speckle
+) -> int:
+    """
+    Detect the gutter by finding the darkest vertical strip
+    in a central band of the page.
+    """
+    # 1) Grayscale & smooth
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+    gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+
+    h, w = gray.shape
+    half = w // 2
+    span = int(w * crop_frac / 2)
+    left, right = half - span, half + span
+
+    # 2) Auto‐threshold (Otsu) to separate dark pixels
+    _, dark_mask = cv2.threshold(
+        gray, 0, 1,
+        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )
+    # dark_mask is 1 for gutter (dark), 0 for page (light)
+
+    # 3) Per-column dark ratio (0–1)
+    col_dark_ratio = dark_mask.sum(axis=0) / float(h)
+    region = col_dark_ratio[left:right]
+
+    # 4) Sliding window of gutter width
+    win = max(1, int(w * gutter_frac))
+    win = min(win, region.shape[0])
+    # compute average over each window
+    kernel = np.ones(win, dtype=float) / win
+    avg_dark = np.convolve(region, kernel, mode='valid')
+
+    # 5) Pick the window with the highest dark ratio
+    idx = int(np.argmax(avg_dark))
+    split_x = left + idx + win // 2
+    return split_x
+
+
 def process_image(
     model: YOLOv10,
     image_path: Path,
-    output_dir: Path,
-    keep_classes: list[int]
+    output_dir: Path
 ) -> None:
     """
     Detect layout, crop out non-abandon bounding region,
@@ -61,28 +105,30 @@ def process_image(
         logging.error(f"Failed to load image: {image_path}")
         return
 
-    # Convert to RGB for model prediction
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = model.predict(image_rgb, classes=keep_classes)
+    results = model.predict(image_rgb,
+                            verbose=False)
     if not results:
         logging.warning(f"No objects detected in {image_path}")
         return
 
     # Compute bounding box extremes
-    boxes = results[0].boxes.xyxy.data.cpu()
-    x1, y1 = int(boxes[:,0].min()), int(boxes[:,1].min())
-    x2, y2 = int(boxes[:,2].max()), int(boxes[:,3].max())
+    boxes = results[0].boxes.xyxy.data.cpu().numpy()
+    max_area_box = boxes[np.argmax((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]))]
+    x1, y1 = int(max_area_box[0]), int(max_area_box[1])
+    x2, y2 = int(max_area_box[2]), int(max_area_box[3])
 
-    # Crop and split pages
     cropped = image_rgb[y1:y2, x1:x2]
-    mid = cropped.shape[1] // 2
+    mid = divider(cropped)
     pages = {'left': cropped[:, :mid], 'right': cropped[:, mid:]}
 
     # Prepare output subdirectory per image
     subdir = output_dir / image_path.stem
     subdir.mkdir(parents=True, exist_ok=True)
 
-    # Save pages
+    original_file = subdir / "original.png"
+    shutil.copy(image_path, original_file)
+
     for side, img in pages.items():
         out_file = subdir / f"{side}.png"
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -135,15 +181,9 @@ def main():
     logging.info(f"Using device: {device}")
 
     model = load_model(args.checkpoint, device)
-    names = model.names
-    # Identify and filter out "abandon" class
-    abandon_idx = next(idx for idx, name in names.items() if name == 'abandon')
-    keep_ids = [idx for idx in names.keys() if idx != abandon_idx]
 
-    # Ensure output directory exists
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find images recursively
     exts = ['png', 'jpg', 'jpeg']
     paths = find_image_paths(args.data_dir, exts)
     if not paths:
@@ -153,7 +193,7 @@ def main():
     logging.info(f"Found {len(paths)} image(s) to process.")
     with tqdm(paths, desc="Processing images", unit='image') as pbar:
         for img_path in pbar:
-            process_image(model, img_path, args.output_dir, keep_ids)
+            process_image(model, img_path, args.output_dir)
 
 
 if __name__ == '__main__':
