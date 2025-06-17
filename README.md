@@ -54,7 +54,7 @@ python single_image_processor.py <IMAGE_PATH> <OUTPUT_DIR> [options]
 Process a single image on CPU:
 
 ```bash
-python single_image_processor.py \
+python processor.py \
   data/sample.jpg \         # Path to your input image
   output \                  # Output directory
   --gpu-id 2                # Use GPU device 2
