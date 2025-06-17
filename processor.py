@@ -4,15 +4,13 @@ import cv2
 import numpy as np
 import torch
 import shutil
+import json
 from pathlib import Path
-from tqdm.auto import tqdm
 
-from doclayout_yolo import YOLOv10
+from ultralytics import YOLO
 
 # Default constants
-MODEL_CHECKPOINT = "checkpoint/yolo11_x.pt"
-DEFAULT_DATA_DIR = "data"
-DEFAULT_OUTPUT_DIR = "output"
+MODEL_CHECKPOINT = "checkpoint/nx_yolo.pt"
 
 
 def setup_logger(level: int = logging.INFO) -> None:
@@ -22,30 +20,25 @@ def setup_logger(level: int = logging.INFO) -> None:
     )
 
 
-def get_device(use_cuda: bool = True) -> torch.device:
-    """Select CPU or CUDA device."""
-    if use_cuda and torch.cuda.is_available():
-        return torch.device('cuda:2')
+def get_device(gpu_id: int = 0) -> torch.device:
+    """
+    Select device based on gpu_id: non-negative uses that CUDA device if available;
+    negative or None selects CPU.
+    """
+    if gpu_id is None or gpu_id < 0:
+        return torch.device('cpu')
+    if torch.cuda.is_available():
+        return torch.device(f'cuda:{gpu_id}')
+    logging.warning('CUDA not available, falling back to CPU')
     return torch.device('cpu')
 
 
-def load_model(checkpoint: Path, device: torch.device) -> YOLOv10:
+def load_model(checkpoint: Path, device: torch.device) -> YOLO:
     """
-    Load the YOLOv10 model from a checkpoint, on specified device.
+    Load the YOLO model from a checkpoint, on specified device.
     """
-    model = YOLOv10(model=str(checkpoint)).to(device)
+    model = YOLO(model=str(checkpoint)).to(device)
     return model
-
-
-def find_image_paths(data_dir: Path, exts: list[str]) -> list[Path]:
-    """
-    Recursively find image files with given extensions (case-insensitive).
-    """
-    image_paths: list[Path] = []
-    for ext in exts:
-        image_paths.extend(data_dir.rglob(f"*.{ext}"))
-        image_paths.extend(data_dir.rglob(f"*.{ext.upper()}"))
-    return image_paths
 
 
 def divider(
@@ -81,7 +74,6 @@ def divider(
     # 4) Sliding window of gutter width
     win = max(1, int(w * gutter_frac))
     win = min(win, region.shape[0])
-    # compute average over each window
     kernel = np.ones(win, dtype=float) / win
     avg_dark = np.convolve(region, kernel, mode='valid')
 
@@ -92,108 +84,114 @@ def divider(
 
 
 def process_image(
-    model: YOLOv10,
+    model: YOLO,
     image_path: Path,
-    output_dir: Path
-) -> None:
+    output_dir: Path = None,
+    crop_frac: float = 0.05,
+    gutter_frac: float = 0.005,
+    blur_ksize: int = 5
+) -> json:
     """
-    Detect layout, crop out non-abandon bounding region,
+    Detect layout, crop the highest-confidence box (no padding),
     split into left/right pages, and save results.
     """
-    image = cv2.imread(str(image_path))
-    if image is None:
-        logging.error(f"Failed to load image: {image_path}")
-        return
-
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = model.predict(image_rgb,
-                            verbose=False)
-    if not results:
-        logging.warning(f"No objects detected in {image_path}")
-        return
-
-    # Compute bounding box extremes
-    boxes = results[0].boxes.xyxy.data.cpu().numpy()
-    max_area_box = boxes[np.argmax((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]))]
-    x1, y1 = int(max_area_box[0]), int(max_area_box[1])
-    x2, y2 = int(max_area_box[2]), int(max_area_box[3])
-
-    cropped = image_rgb[y1:y2, x1:x2]
-    mid = divider(cropped)
-    pages = {'left': cropped[:, :mid], 'right': cropped[:, mid:]}
-
-    # Prepare output subdirectory per image
     subdir = output_dir / image_path.stem
     subdir.mkdir(parents=True, exist_ok=True)
 
-    original_file = subdir / "original.png"
-    shutil.copy(image_path, original_file)
+    # Predict boxes
+    results = model.predict(str(image_path), verbose=False)
+    if not results or len(results[0].boxes) == 0:
+        raise RuntimeError(f"No objects detected in {image_path}")
 
-    for side, img in pages.items():
-        out_file = subdir / f"{side}.png"
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(out_file), img_bgr)
-        logging.info(f"Saved page: {out_file}")
+    boxes = results[0].boxes.xyxy.cpu().numpy()
+    confs = results[0].boxes.conf.cpu().numpy()
+    max_idx = confs.argmax()
+    x1, y1, x2, y2 = map(int, boxes[max_idx])
+    score = float(confs[max_idx])
+
+    # Load and crop
+    img_bgr = cv2.imread(str(image_path))
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    cropped = img_rgb[y1:y2, x1:x2]
+
+    # Split pages
+    mid = divider(cropped, crop_frac=crop_frac,
+                  gutter_frac=gutter_frac,
+                  blur_ksize=blur_ksize)
+    left_img = cropped[:, :mid]
+    right_img = cropped[:, mid:]
+
+    # Save images
+    left_path = subdir / "left.jpg"
+    right_path = subdir / "right.jpg"
+    cv2.imwrite(str(left_path), cv2.cvtColor(left_img, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR))
+
+    obj = {
+        "left_image": str(left_path),
+        "right_image": str(right_path),
+        "confidence": score
+    }
+    # logging.info(f"Processed {image_path}: {obj}")
+    return json.dumps(obj, indent=2)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Document layout cropper using YOLOv10"
+        description="Document layout cropper using YOLO object detection."
     )
     parser.add_argument(
-        '--data-dir', '-i',
+        'image_path',
         type=Path,
-        default=Path(DEFAULT_DATA_DIR),
-        help='Input directory containing images'
+        help='Path to the input image'
     )
     parser.add_argument(
-        '--output-dir', '-o',
+        'output_dir',
         type=Path,
-        default=Path(DEFAULT_OUTPUT_DIR),
-        help='Directory to save processed images'
+        help='Directory to save outputs'
     )
     parser.add_argument(
         '--checkpoint', '-c',
         type=Path,
         default=Path(MODEL_CHECKPOINT),
-        help='YOLOv10 model checkpoint path'
+        help='YOLO model checkpoint'
     )
     parser.add_argument(
-        '--no-cuda',
-        action='store_true',
-        help='Disable CUDA even if available'
+        '--gpu-id',
+        type=int,
+        default=0,
+        help='GPU device ID (use -1 for CPU)'
     )
     parser.add_argument(
         '--log-level',
         default='INFO',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-        help='Set the logging level'
+        help='Set logging level'
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    level = getattr(logging, args.log_level)
-    setup_logger(level)
+    setup_logger(getattr(logging, args.log_level))
 
-    device = get_device(not args.no_cuda)
+    device = get_device(args.gpu_id)
     logging.info(f"Using device: {device}")
 
     model = load_model(args.checkpoint, device)
-
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    exts = ['png', 'jpg', 'jpeg']
-    paths = find_image_paths(args.data_dir, exts)
-    if not paths:
-        logging.warning(f"No images found in {args.data_dir} with extensions {exts}")
-        return
-
-    logging.info(f"Found {len(paths)} image(s) to process.")
-    with tqdm(paths, desc="Processing images", unit='image') as pbar:
-        for img_path in pbar:
-            process_image(model, img_path, args.output_dir)
+    try:
+        result = process_image(
+            model,
+            args.image_path,
+            args.output_dir
+        )
+        # Print JSON to stdout
+        print(json.dumps(result))
+    except Exception as e:
+        logging.error(e)
+        exit(1)
 
 
 if __name__ == '__main__':

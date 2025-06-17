@@ -1,0 +1,10 @@
+yolo task=detect\
+     mode=train\
+     model=yolo11n.pt\
+     data=PDC/data.yaml\
+     epochs=1024\
+     imgsz=640\
+     device=2\
+     seed=42\
+     box=64\
+     plots=True
