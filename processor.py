@@ -138,8 +138,8 @@ def process_image(
     # Save images
     left_path = output_dir / f"{image_path.stem}_1L.jpg"
     right_path = output_dir / f"{image_path.stem}_2R.jpg"
-    cv2.imwrite(str(left_path), cv2.cvtColor(left_img, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(left_path), cv2.cvtColor(left_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+    cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
 
     # create json if not exists
     if not os.path.exists(output_dir / 'results.json'):

@@ -1,4 +1,4 @@
-# Single Image Processor
+# NxScan
 
 A command-line tool to detect and crop a single document image using YOLO, split it into left/right pages, and output a JSON with paths and confidence score.
 
@@ -33,12 +33,12 @@ Ensure you have a YOLO checkpoint at `checkpoint/nx_yolo.pt`, or pass your own w
 ## Usage
 
 ```bash
-python single_image_processor.py <IMAGE_PATH> <OUTPUT_DIR> [options]
+python processor.py <IMAGE_PATH> <OUTPUT_DIR> [options]
 ```
 
 ### Positional Arguments
 
-* `<IMAGE_PATH>`: Path to the input image file (e.g., `data/my_doc.jpg`).
+* `<IMAGE_PATH>`: Path to the input image files (e.g., `data/`).
 * `<OUTPUT_DIR>`: Directory where outputs will be saved.
 
 ### Options
