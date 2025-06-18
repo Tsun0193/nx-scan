@@ -1,9 +1,9 @@
+import os
 import argparse
 import logging
 import cv2
 import numpy as np
 import torch
-import shutil
 import json
 from pathlib import Path
 
@@ -31,6 +31,17 @@ def get_device(gpu_id: int = 0) -> torch.device:
         return torch.device(f'cuda:{gpu_id}')
     logging.warning('CUDA not available, falling back to CPU')
     return torch.device('cpu')
+
+
+def find_image_paths(data_dir: Path, exts: list[str]) -> list[Path]:
+    """
+    Recursively find image files with given extensions (case-insensitive).
+    """
+    image_paths: list[Path] = []
+    for ext in exts:
+        image_paths.extend(data_dir.rglob(f"*.{ext}"))
+        image_paths.extend(data_dir.rglob(f"*.{ext.upper()}"))
+    return image_paths
 
 
 def load_model(checkpoint: Path, device: torch.device) -> YOLO:
@@ -90,27 +101,30 @@ def process_image(
     crop_frac: float = 0.05,
     gutter_frac: float = 0.005,
     blur_ksize: int = 5
-) -> json:
+):
     """
     Detect layout, crop the highest-confidence box (no padding),
     split into left/right pages, and save results.
     """
-    subdir = output_dir / image_path.stem
-    subdir.mkdir(parents=True, exist_ok=True)
-
     # Predict boxes
     results = model.predict(str(image_path), verbose=False)
-    if not results or len(results[0].boxes) == 0:
-        raise RuntimeError(f"No objects detected in {image_path}")
-
     boxes = results[0].boxes.xyxy.cpu().numpy()
     confs = results[0].boxes.conf.cpu().numpy()
+
+    if boxes.shape[0] == 0:
+        logging.warning(f"No objects detected in {image_path.name}, skipping.")
+        return None
+
     max_idx = confs.argmax()
     x1, y1, x2, y2 = map(int, boxes[max_idx])
     score = float(confs[max_idx])
 
     # Load and crop
     img_bgr = cv2.imread(str(image_path))
+    if img_bgr is None:
+        logging.warning(f"Failed to read image: {image_path}")
+        return None
+
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     cropped = img_rgb[y1:y2, x1:x2]
 
@@ -122,18 +136,37 @@ def process_image(
     right_img = cropped[:, mid:]
 
     # Save images
-    left_path = subdir / "left.jpg"
-    right_path = subdir / "right.jpg"
+    left_path = output_dir / f"{image_path.stem}_1L.jpg"
+    right_path = output_dir / f"{image_path.stem}_2R.jpg"
     cv2.imwrite(str(left_path), cv2.cvtColor(left_img, cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR))
 
-    obj = {
+    # create json if not exists
+    if not os.path.exists(output_dir / 'results.json'):
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump([], f, indent=2)
+    with open(output_dir / 'results.json', 'r+') as f:
+        data = json.load(f)
+        for item in data:
+            if item['original_image'] == str(image_path):
+                logging.info(f"Image {image_path} will be replaced in results.json")
+                data.remove(item)
+        f.seek(0)
+        f.truncate()
+        data.append({
+            "original_image": str(image_path),
+            "left_image": str(left_path),
+            "right_image": str(right_path),
+            "confidence": score
+        })
+        json.dump(data, f, indent=2)
+
+    return {
+        "original_image": str(image_path),
         "left_image": str(left_path),
         "right_image": str(right_path),
         "confidence": score
     }
-    # logging.info(f"Processed {image_path}: {obj}")
-    return json.dumps(obj, indent=2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,9 +174,10 @@ def parse_args() -> argparse.Namespace:
         description="Document layout cropper using YOLO object detection."
     )
     parser.add_argument(
-        'image_path',
+        '--data-dir', '-i',
         type=Path,
-        help='Path to the input image'
+        required=True,
+        help='Input directory containing images'
     )
     parser.add_argument(
         'output_dir',
@@ -181,17 +215,25 @@ def main():
     model = load_model(args.checkpoint, device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        result = process_image(
-            model,
-            args.image_path,
-            args.output_dir
-        )
-        # Print JSON to stdout
-        print(json.dumps(result))
-    except Exception as e:
-        logging.error(e)
-        exit(1)
+    exts = ['png', 'jpg', 'jpeg']
+    paths = find_image_paths(args.data_dir, exts)
+
+    if not paths:
+        logging.error(f"No images found in {args.data_dir} with extensions {exts}")
+        return
+    
+    logging.info(f"Found {len(paths)} images to process")
+
+    for img_path in paths:
+        try:
+            result = process_image(
+                model,
+                img_path,
+                output_dir=args.output_dir
+            )
+            logging.info(f"Processed {img_path}: {result}")
+        except Exception as e:
+            logging.error(f"Error processing {img_path}: {e}")
 
 
 if __name__ == '__main__':

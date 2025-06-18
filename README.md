@@ -51,7 +51,7 @@ python single_image_processor.py <IMAGE_PATH> <OUTPUT_DIR> [options]
 
 ### Example
 
-Process a single image on CPU:
+Process an image folder:
 
 ```bash
 python processor.py \
