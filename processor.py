@@ -94,23 +94,16 @@ def divider(
     return split_x
 
 
-def process_image(
-    model: YOLO,
+def detect_layout(
     image_path: Path,
-    output_dir: Path = None,
-    crop_frac: float = 0.05,
-    gutter_frac: float = 0.005,
-    blur_ksize: int = 5
+    result,
+    output_dir: Path,
+    crop_frac: float,
+    gutter_frac: float,
+    blur_ksize: int
 ):
-    """
-    Detect layout, crop the highest-confidence box (no padding),
-    split into left/right pages, and save results.
-    """
-    # Predict boxes
-    results = model.predict(str(image_path), verbose=False)
-    boxes = results[0].boxes.xyxy.cpu().numpy()
-    confs = results[0].boxes.conf.cpu().numpy()
-
+    boxes = result.boxes.xyxy.cpu().numpy()
+    confs = result.boxes.conf.cpu().numpy()
     if boxes.shape[0] == 0:
         logging.warning(f"No objects detected in {image_path.name}, skipping.")
         return None
@@ -119,7 +112,6 @@ def process_image(
     x1, y1, x2, y2 = map(int, boxes[max_idx])
     score = float(confs[max_idx])
 
-    # Load and crop
     img_bgr = cv2.imread(str(image_path))
     if img_bgr is None:
         logging.warning(f"Failed to read image: {image_path}")
@@ -128,29 +120,24 @@ def process_image(
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     cropped = img_rgb[y1:y2, x1:x2]
 
-    # Split pages
     mid = divider(cropped, crop_frac=crop_frac,
                   gutter_frac=gutter_frac,
                   blur_ksize=blur_ksize)
     left_img = cropped[:, :mid]
     right_img = cropped[:, mid:]
 
-    # Save images
     left_path = output_dir / f"{image_path.stem}_1L.jpg"
     right_path = output_dir / f"{image_path.stem}_2R.jpg"
     cv2.imwrite(str(left_path), cv2.cvtColor(left_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
     cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
 
-    # create json if not exists
-    if not os.path.exists(output_dir / 'results.json'):
-        with open(output_dir / 'results.json', 'w') as f:
+    results_json = output_dir / 'results.json'
+    if not results_json.exists():
+        with open(results_json, 'w') as f:
             json.dump([], f, indent=2)
-    with open(output_dir / 'results.json', 'r+') as f:
+    with open(results_json, 'r+') as f:
         data = json.load(f)
-        for item in data:
-            if item['original_image'] == str(image_path):
-                logging.info(f"Image {image_path} will be replaced in results.json")
-                data.remove(item)
+        data = [item for item in data if item['original_image'] != str(image_path)]
         f.seek(0)
         f.truncate()
         data.append({
@@ -180,7 +167,7 @@ def parse_args() -> argparse.Namespace:
         help='Input directory containing images'
     )
     parser.add_argument(
-        'output_dir',
+        '--output_dir', '-o',
         type=Path,
         help='Directory to save outputs'
     )
@@ -202,6 +189,30 @@ def parse_args() -> argparse.Namespace:
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         help='Set logging level'
     )
+    parser.add_argument(
+        '--batch', '-b',
+        type=int,
+        default=1,
+        help='Batch size for processing images (default: 1)'
+    )
+    parser.add_argument(
+        '--crop_frac',
+        type=float,
+        default=0.05,
+        help='Fraction of image width to search for gutter (default: 0.05)'
+    )
+    parser.add_argument(
+        '--gutter_frac',
+        type=float,
+        default=0.005,
+        help='Gutter width as fraction of image width (default: 0.005)'
+    )
+    parser.add_argument(
+        '--blur_ksize',
+        type=int,
+        default=5,
+        help='Kernel size for Gaussian blur (default: 5)'
+    )
     return parser.parse_args()
 
 
@@ -215,25 +226,60 @@ def main():
     model = load_model(args.checkpoint, device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    results = args.output_dir / 'results.json' 
+    if results.exists():
+        with open(results, 'r') as f:
+            try:
+                existeds = json.load(f)
+                proceeds = {
+                    item['original_image'] for item in existeds
+                }
+            except json.JSONDecodeError:
+                logging.warning("Failed to decode JSON from results file.")
+
     exts = ['png', 'jpg', 'jpeg']
     paths = find_image_paths(args.data_dir, exts)
 
+    unprocessed = [p for p in paths if str(p) not in proceeds]
+    skipped = len(paths) - len(unprocessed)
+    if skipped > 0:
+        logging.info(f"Skipping {skipped} already processed images.")
+    paths = unprocessed
+
     if not paths:
-        logging.error(f"No images found in {args.data_dir} with extensions {exts}")
+        logging.error(f"No unprocessed images found in {args.data_dir} with extensions {exts}")
         return
     
     logging.info(f"Found {len(paths)} images to process")
 
-    for img_path in paths:
+    if args.batch == 1:
+        for img_path in paths:
+            try:
+                result = model.predict(str(img_path), verbose=False)[0]
+                out = detect_layout(
+                    img_path, result, args.output_dir,
+                    args.crop_frac, args.gutter_frac, args.blur_ksize
+                )
+                logging.info(f"Processed {img_path}: {out}")
+            except Exception as e:
+                logging.error(f"Error processing {img_path}: {e}")
+    else:
+        # batch inference
+        sources = [str(p) for p in paths]
         try:
-            result = process_image(
-                model,
-                img_path,
-                output_dir=args.output_dir
+            batch_results = model.predict(
+                sources,
+                batch=args.batch,
+                verbose=False
             )
-            logging.info(f"Processed {img_path}: {result}")
+            for img_path, result in zip(paths, batch_results):
+                out = detect_layout(
+                    img_path, result, args.output_dir,
+                    args.crop_frac, args.gutter_frac, args.blur_ksize
+                )
+                logging.info(f"Processed {img_path}: {out}")
         except Exception as e:
-            logging.error(f"Error processing {img_path}: {e}")
+            logging.error(f"Batch inference failed: {e}")
 
 
 if __name__ == '__main__':
