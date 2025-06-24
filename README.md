@@ -28,12 +28,12 @@ pip install ultralytics opencv-python numpy torch
 Ensure you have a YOLO checkpoint trained for document detection (e.g. `checkpoint/nx_yolo.pt`), or pass your own model path using `--checkpoint`.
 
 ## Usage
-
-```bash
-python processor.py -i <DATA_DIR> -o <OUTPUT_DIR> [options]
+<OUTPUT_DIR> [options]
 ```
 
 ### Positional Arguments
+```bash
+python processor.py -i <DATA_DIR> -o 
 
 * `<DATA_DIR>`: Path to the folder containing input images (e.g., `data/`).
 * `<OUTPUT_DIR>`: Directory where outputs and `results.json` will be saved.

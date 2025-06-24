@@ -54,7 +54,7 @@ def load_model(checkpoint: Path, device: torch.device) -> YOLO:
 
 def divider(
     img: np.ndarray,
-    crop_frac: float = 0.05,    # how far left/right of image‐center to search
+    crop_frac: float = 0.08,    # how far left/right of image‐center to search
     gutter_frac: float = 0.005,  # gutter width as fraction of image width
     blur_ksize: int = 5        # optional smoothing to reduce speckle
 ) -> int:
@@ -239,6 +239,8 @@ def main():
 
     exts = ['png', 'jpg', 'jpeg']
     paths = find_image_paths(args.data_dir, exts)
+
+    proceeds = set()
 
     unprocessed = [p for p in paths if str(p) not in proceeds]
     skipped = len(paths) - len(unprocessed)

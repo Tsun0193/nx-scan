@@ -197,3 +197,4 @@ output/*
 runs/*
 PDC*/
 *.pt
+data/
