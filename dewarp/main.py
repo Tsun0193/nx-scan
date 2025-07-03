@@ -4,7 +4,7 @@ import gdown
 import logging
 from pytorch_lightning import LightningModule
 from pathlib import Path
-
+from geotr.inv3d_model.models.geotr.geotr_template import GeoTrTemplate
 
 def setup_logger(level: int = logging.INFO) -> None:
     logging.basicConfig(
@@ -69,7 +69,7 @@ def main():
     setup_logger(logging.DEBUG)  # Set to DEBUG for detailed output
     logging.info("Starting dewarping process...")
     model = load_model(
-        model_class=LightningModule,  # Replace with your actual model class
+        model_class=GeoTrTemplate,
         model_name="geotr_template@inv3d",
         yaml_path="models.yaml",
         device="cuda" if torch.cuda.is_available() else "cpu"
