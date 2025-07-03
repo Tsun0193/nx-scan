@@ -198,3 +198,4 @@ runs/*
 PDC*/
 *.pt
 data/
+*.zip
