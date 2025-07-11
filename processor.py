@@ -56,7 +56,8 @@ def divider(
     img: np.ndarray,
     crop_frac: float = 0.08,    # how far left/right of image‐center to search
     gutter_frac: float = 0.005,  # gutter width as fraction of image width
-    blur_ksize: int = 5        # optional smoothing to reduce speckle
+    blur_ksize: int = 5,        # optional smoothing to reduce speckle
+    contrast_threshold: float = 1.2 # threshold for gutter detection
 ) -> int:
     """
     Detect the gutter by finding the darkest vertical strip
@@ -87,6 +88,12 @@ def divider(
     win = min(win, region.shape[0])
     kernel = np.ones(win, dtype=float) / win
     avg_dark = np.convolve(region, kernel, mode='valid')
+
+    max_dark = np.max(avg_dark)
+    mean_dark = np.mean(avg_dark)
+
+    if max_dark < contrast_threshold * mean_dark:
+        return None
 
     # 5) Pick the window with the highest dark ratio
     idx = int(np.argmax(avg_dark))
@@ -123,13 +130,6 @@ def detect_layout(
     mid = divider(cropped, crop_frac=crop_frac,
                   gutter_frac=gutter_frac,
                   blur_ksize=blur_ksize)
-    left_img = cropped[:, :mid]
-    right_img = cropped[:, mid:]
-
-    left_path = output_dir / f"{image_path.stem}_1L.jpg"
-    right_path = output_dir / f"{image_path.stem}_2R.jpg"
-    cv2.imwrite(str(left_path), cv2.cvtColor(left_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-    cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
 
     results_json = output_dir / 'results.json'
     if not results_json.exists():
@@ -140,20 +140,40 @@ def detect_layout(
         data = [item for item in data if item['original_image'] != str(image_path)]
         f.seek(0)
         f.truncate()
-        data.append({
-            "original_image": str(image_path),
-            "left_image": str(left_path),
-            "right_image": str(right_path),
-            "confidence": score
-        })
-        json.dump(data, f, indent=2)
 
-    return {
-        "original_image": str(image_path),
-        "left_image": str(left_path),
-        "right_image": str(right_path),
-        "confidence": score
-    }
+        if mid is None:
+            # Single-page fallback
+            single_path = output_dir / f"{image_path.stem}_1S.jpg"
+            cv2.imwrite(str(single_path), cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+            record = {
+                "original_image": str(image_path),
+                "single_image": str(single_path),
+                "confidence": score,
+                "split": None
+            }
+            data.append(record)
+            json.dump(data, f, indent=2)
+            return record
+        else:
+            # Normal left/right split
+            left_img = cropped[:, :mid]
+            right_img = cropped[:, mid:]
+
+            left_path = output_dir / f"{image_path.stem}_1L.jpg"
+            right_path = output_dir / f"{image_path.stem}_2R.jpg"
+            cv2.imwrite(str(left_path), cv2.cvtColor(left_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+            cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+
+            record = {
+                "original_image": str(image_path),
+                "left_image": str(left_path),
+                "right_image": str(right_path),
+                "confidence": score,
+                "split": mid
+            }
+            data.append(record)
+            json.dump(data, f, indent=2)
+            return record
 
 
 def parse_args() -> argparse.Namespace:
