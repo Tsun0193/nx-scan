@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import torch
 import json
+import shutil
 from pathlib import Path
 
 from ultralytics import YOLO
@@ -109,71 +110,129 @@ def detect_layout(
     gutter_frac: float,
     blur_ksize: int
 ):
+    # 0) Prep output_dir & results.json (always in scope)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results_json = output_dir / 'results.json'
+    if not results_json.exists():
+        results_json.write_text("[]")
+
+    # 1) Try to read the image
+    img_bgr = cv2.imread(str(image_path))
+    if img_bgr is None:
+        logging.warning(f"Failed to read image: {image_path}, copying as single page.")
+        single_path = output_dir / f"{image_path.stem}_1S{image_path.suffix}"
+        shutil.copy2(str(image_path), str(single_path))
+
+        record = {
+            "original_image": str(image_path),
+            "single_image": str(single_path),
+            "confidence": None,
+            "split": None
+        }
+        # append to JSON
+        with open(results_json, 'r+') as f:
+            data = json.load(f)
+            data = [r for r in data if r.get('original_image') != str(image_path)]
+            data.append(record)
+            f.seek(0); f.truncate()
+            json.dump(data, f, indent=2)
+
+        return record
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # 2) Run your detector
     boxes = result.boxes.xyxy.cpu().numpy()
     confs = result.boxes.conf.cpu().numpy()
-    if boxes.shape[0] == 0:
-        logging.warning(f"No objects detected in {image_path.name}, skipping.")
-        return None
 
+    # 3) No detections → save full image as single page
+    if boxes.shape[0] == 0:
+        logging.warning(f"No objects detected in {image_path.name}, saving as single page.")
+        single_path = output_dir / f"{image_path.stem}_1S{image_path.suffix}"
+        cv2.imwrite(
+            str(single_path),
+            cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 100]
+        )
+
+        record = {
+            "original_image": str(image_path),
+            "single_image": str(single_path),
+            "confidence": None,
+            "split": None
+        }
+        with open(results_json, 'r+') as f:
+            data = json.load(f)
+            data = [r for r in data if r.get('original_image') != str(image_path)]
+            data.append(record)
+            f.seek(0); f.truncate()
+            json.dump(data, f, indent=2)
+
+        return record
+
+    # 4) Pick best box, crop
     max_idx = confs.argmax()
     x1, y1, x2, y2 = map(int, boxes[max_idx])
     score = float(confs[max_idx])
-
-    img_bgr = cv2.imread(str(image_path))
-    if img_bgr is None:
-        logging.warning(f"Failed to read image: {image_path}")
-        return None
-
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     cropped = img_rgb[y1:y2, x1:x2]
 
-    mid = divider(cropped, crop_frac=crop_frac,
-                  gutter_frac=gutter_frac,
-                  blur_ksize=blur_ksize)
+    # 5) Try to split into two pages
+    mid = divider(
+        cropped,
+        crop_frac=crop_frac,
+        gutter_frac=gutter_frac,
+        blur_ksize=blur_ksize
+    )
 
-    results_json = output_dir / 'results.json'
-    if not results_json.exists():
-        with open(results_json, 'w') as f:
-            json.dump([], f, indent=2)
+    # 6) If we can’t split into two, treat as single
+    if mid is None:
+        logging.warning(f"Could not split into two pages for {image_path.name}, saving as single page.")
+        single_path = output_dir / f"{image_path.stem}_1S{image_path.suffix}"
+        cv2.imwrite(
+            str(single_path),
+            cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 100]
+        )
+
+        record = {
+            "original_image": str(image_path),
+            "single_image": str(single_path),
+            "confidence": score,
+            "split": None
+        }
+        with open(results_json, 'r+') as f:
+            data = json.load(f)
+            data = [r for r in data if r.get('original_image') != str(image_path)]
+            data.append(record)
+            f.seek(0); f.truncate()
+            json.dump(data, f, indent=2)
+
+        return record
+
+    # 7) Otherwise, write left/right pages
+    left_img  = cropped[:, :mid]
+    right_img = cropped[:, mid:]
+    left_path = output_dir / f"{image_path.stem}_1L{image_path.suffix}"
+    right_path= output_dir / f"{image_path.stem}_2R{image_path.suffix}"
+
+    cv2.imwrite(str(left_path),  cv2.cvtColor(left_img,  cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+    cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+
+    record = {
+        "original_image": str(image_path),
+        "left_image": str(left_path),
+        "right_image": str(right_path),
+        "confidence": score,
+        "split": mid
+    }
     with open(results_json, 'r+') as f:
         data = json.load(f)
-        data = [item for item in data if item['original_image'] != str(image_path)]
-        f.seek(0)
-        f.truncate()
+        data = [r for r in data if r.get('original_image') != str(image_path)]
+        data.append(record)
+        f.seek(0); f.truncate()
+        json.dump(data, f, indent=2)
 
-        if mid is None:
-            # Single-page fallback
-            single_path = output_dir / f"{image_path.stem}_1S.jpg"
-            cv2.imwrite(str(single_path), cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-            record = {
-                "original_image": str(image_path),
-                "single_image": str(single_path),
-                "confidence": score,
-                "split": None
-            }
-            data.append(record)
-            json.dump(data, f, indent=2)
-            return record
-        else:
-            # Normal left/right split
-            left_img = cropped[:, :mid]
-            right_img = cropped[:, mid:]
-
-            left_path = output_dir / f"{image_path.stem}_1L.jpg"
-            right_path = output_dir / f"{image_path.stem}_2R.jpg"
-            cv2.imwrite(str(left_path), cv2.cvtColor(left_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-            cv2.imwrite(str(right_path), cv2.cvtColor(right_img, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-
-            record = {
-                "original_image": str(image_path),
-                "left_image": str(left_path),
-                "right_image": str(right_path),
-                "confidence": score,
-                "split": mid
-            }
-            data.append(record)
-            json.dump(data, f, indent=2)
-            return record
+    return record
 
 
 def parse_args() -> argparse.Namespace:
