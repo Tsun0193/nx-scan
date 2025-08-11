@@ -1,7 +1,7 @@
 doclayout_yolo==0.0.4
 matplotlib==3.5.1
 opencv_contrib_python==4.11.0.86
-opencv_python==3.4.18.65
+opencv_python>=4.6.0
 opencv_python_headless==4.11.0.86
 pathlib==1.0.1
 torch==2.7.1
