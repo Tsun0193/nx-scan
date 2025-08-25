@@ -198,3 +198,7 @@ runs/*
 PDC*/
 *.pt
 data/
+pdf*
+draft.py
+cropped/*
+pdc/*
