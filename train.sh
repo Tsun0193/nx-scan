@@ -1,3 +1,4 @@
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 \
 yolo task=detect\
      mode=train\
      model=yolov10x.pt\
@@ -15,6 +16,6 @@ yolo task=detect\
      rect=True\
      device=2\
      seed=42\
-     box=256\
+     box=64\
      plots=True\
      project=runs

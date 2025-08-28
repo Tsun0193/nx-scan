@@ -7,13 +7,12 @@ import torch
 import json
 import shutil
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 from ultralytics import YOLO
 
 # Default constants
 MODEL_CHECKPOINT = "checkpoint/nx_yolo.pt"
-DIVIDER_CHECKPOINT = "checkpoint/nx_divider.pt"
 
 
 def setup_logger(level: int = logging.INFO) -> None:
@@ -47,13 +46,68 @@ def find_image_paths(data_dir: Path, exts: List[str]) -> List[Path]:
     return image_paths
 
 
-def load_models(det_checkpoint: Path, divider_checkpoint: Path, device: torch.device) -> Tuple[YOLO, YOLO]:
+def load_model(checkpoint: Path, device: torch.device) -> YOLO:
     """
-    Load the main detector and the divider YOLO model on the specified device.
+    Load the YOLO model from a checkpoint, on specified device.
     """
-    det_model = YOLO(model=str(det_checkpoint)).to(device)
-    divider_model = YOLO(model=str(divider_checkpoint)).to(device)
-    return det_model, divider_model
+    model = YOLO(model=str(checkpoint)).to(device)
+    return model
+
+
+def divider(
+    img: np.ndarray,
+    crop_frac: float = 0.08,     # how far left/right of image-center to search
+    gutter_frac: float = 0.005,  # gutter width as fraction of image width
+    blur_ksize: int = 5,         # optional smoothing to reduce speckle
+    contrast_threshold: float = 1.2  # threshold for gutter detection
+) -> Optional[int]:
+    """
+    Detect the gutter by finding the darkest vertical strip
+    in a central band of the page.
+    Returns the x position of the split or None if no strong gutter.
+    """
+    # 1) Grayscale & smooth
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+    gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+
+    h, w = gray.shape
+    half = w // 2
+    span = int(w * crop_frac / 2)
+    left, right = max(0, half - span), min(w, half + span)
+    if right <= left:
+        return None
+
+    # 2) Auto-threshold (Otsu) to separate dark pixels
+    _, dark_mask = cv2.threshold(
+        gray, 0, 1,
+        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )
+    # dark_mask is 1 for gutter (dark), 0 for page (light)
+
+    # 3) Per-column dark ratio (0–1)
+    col_dark_ratio = dark_mask.sum(axis=0) / float(h)
+    region = col_dark_ratio[left:right]
+    if region.size == 0:
+        return None
+
+    # 4) Sliding window of gutter width
+    win = max(1, int(w * gutter_frac))
+    win = min(win, region.shape[0])
+    kernel = np.ones(win, dtype=float) / win
+    avg_dark = np.convolve(region, kernel, mode='valid')
+
+    max_dark = float(np.max(avg_dark)) if avg_dark.size else 0.0
+    mean_dark = float(np.mean(avg_dark)) if avg_dark.size else 0.0
+    if avg_dark.size == 0 or (mean_dark == 0 and max_dark == 0):
+        return None
+
+    if max_dark < contrast_threshold * (mean_dark + 1e-8):
+        return None
+
+    # 5) Pick the window with the highest dark ratio
+    idx = int(np.argmax(avg_dark))
+    split_x = left + idx + win // 2
+    return split_x
 
 
 def _save_result_json(results_json: Path, record: dict, image_key: str = 'original_image'):
@@ -72,96 +126,13 @@ def _save_result_json(results_json: Path, record: dict, image_key: str = 'origin
         json.dump(data, f, indent=2)
 
 
-def pick_center_box(result, img_w: int, img_h: int, center_frac: float = 0.25,
-                    min_conf: float = 0.0, class_id: Optional[int] = None) -> Optional[dict]:
-    """
-    From a YOLO result, pick the box nearest the image center with preference for highest confidence.
-    Returns a dict with fields: xyxy, conf, cls_id, center_x, center_y
-    or None if no boxes.
-    """
-    boxes = getattr(result, "boxes", None)
-    if boxes is None or boxes.data is None or len(boxes) == 0:
-        return None
-
-    xyxy = boxes.xyxy
-    conf = boxes.conf
-    cls  = boxes.cls
-    # Move to CPU numpy
-    xyxy = xyxy.detach().cpu().numpy()
-    conf = conf.detach().cpu().numpy().reshape(-1)
-    cls  = cls.detach().cpu().numpy().astype(int).reshape(-1)
-
-    # Optional class filter
-    idxs = np.arange(len(conf))
-    if class_id is not None:
-        idxs = idxs[cls == class_id]
-    # Confidence filter
-    idxs = idxs[conf[idxs] >= min_conf]
-
-    if idxs.size == 0:
-        return None
-
-    cx_img, cy_img = img_w / 2.0, img_h / 2.0
-    centers_x = (xyxy[idxs, 0] + xyxy[idxs, 2]) / 2.0
-    centers_y = (xyxy[idxs, 1] + xyxy[idxs, 3]) / 2.0
-
-    # prefer inside center window first
-    in_center = (np.abs(centers_x - cx_img) <= center_frac * img_w) & \
-                (np.abs(centers_y - cy_img) <= center_frac * img_h)
-    cand = idxs[in_center]
-    if cand.size == 0:
-        # fallback: closest to center (tie-break by higher conf)
-        d = np.hypot(centers_x - cx_img, centers_y - cy_img)
-        order = np.lexsort(( -conf[idxs], d ))  # sort by distance asc, then conf desc
-        i = idxs[order[0]]
-    else:
-        # inside window: pick highest conf, tie-break by distance
-        d = np.hypot(centers_x[in_center] - cx_img, centers_y[in_center] - cy_img)
-        conf_c = conf[cand]
-        order = np.lexsort(( d, -conf_c ))  # sort by conf desc, then distance asc
-        i = cand[order[0]]
-
-    x1, y1, x2, y2 = xyxy[i]
-    return {
-        "xyxy": [float(x1), float(y1), float(x2), float(y2)],
-        "conf": float(conf[i]),
-        "cls_id": int(cls[i]),
-        "center_x": float((x1 + x2) / 2.0),
-        "center_y": float((y1 + y2) / 2.0),
-    }
-
-
-def divider_with_yolo(
-    img_rgb: np.ndarray,
-    divider_model: YOLO,
-    center_frac: float = 0.25,
-    min_conf: float = 0.0,
-    class_id: Optional[int] = None
-) -> Optional[int]:
-    """
-    Use a trained YOLO model to detect the divider (vertical line/strip).
-    Returns the x coordinate of the split (average of left/right x of the chosen box),
-    or None if not found.
-    """
-    H, W = img_rgb.shape[:2]
-    res = divider_model.predict(img_rgb, verbose=False)[0]
-    pick = pick_center_box(res, img_w=W, img_h=H, center_frac=center_frac,
-                           min_conf=min_conf, class_id=class_id)
-    if pick is None:
-        return None
-    x1, _, x2, _ = pick["xyxy"]
-    mid = int(round((x1 + x2) / 2.0))
-    return mid
-
-
 def detect_layout(
     image_path: Path,
     result,
     output_dir: Path,
-    divider_model: YOLO,
-    center_frac: float,
-    divider_min_conf: float,
-    divider_class: Optional[int]
+    crop_frac: float,
+    gutter_frac: float,
+    blur_ksize: int
 ):
     # 0) Prep output_dir & results.json (always in scope)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -188,7 +159,7 @@ def detect_layout(
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    # 2) Main detector result already computed -> result
+    # 2) Run your detector (already computed -> result)
     boxes = result.boxes.xyxy.cpu().numpy()
     confs = result.boxes.conf.cpu().numpy()
 
@@ -210,7 +181,7 @@ def detect_layout(
         _save_result_json(results_json, record)
         return record
 
-    # 4) Pick best box (highest conf), crop
+    # 4) Pick best box, crop
     max_idx = int(confs.argmax())
     x1, y1, x2, y2 = map(int, boxes[max_idx])
     score = float(confs[max_idx])
@@ -234,19 +205,19 @@ def detect_layout(
         }
         _save_result_json(results_json, record)
         return record
+    # ================================
 
-    # 5) Use YOLO divider model to find split x (average of x1/x2 of chosen divider box)
-    mid = divider_with_yolo(
+    # 5) Try to split into two pages (landscape only)
+    mid = divider(
         cropped,
-        divider_model=divider_model,
-        center_frac=center_frac,
-        min_conf=divider_min_conf,
-        class_id=divider_class
+        crop_frac=crop_frac,
+        gutter_frac=gutter_frac,
+        blur_ksize=blur_ksize
     )
 
     # 6) If we can’t split into two, treat as single
     if mid is None:
-        logging.info(f"No divider detected for {image_path.name}, saving as single page.")
+        logging.info(f"No strong gutter for {image_path.name}, saving as single page.")
         single_path = output_dir / f"{image_path.stem}_1S{image_path.suffix}"
         cv2.imwrite(
             str(single_path),
@@ -301,13 +272,7 @@ def parse_args() -> argparse.Namespace:
         '--checkpoint', '-c',
         type=Path,
         default=Path(MODEL_CHECKPOINT),
-        help='YOLO model checkpoint for main detector'
-    )
-    parser.add_argument(
-        '--divider_checkpoint', '-dc',
-        type=Path,
-        default=Path(DIVIDER_CHECKPOINT),
-        help='YOLO model checkpoint for divider detection'
+        help='YOLO model checkpoint'
     )
     parser.add_argument(
         '--gpu-id',
@@ -327,24 +292,23 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help='Batch size for processing images (default: 1)'
     )
-    # Divider model tuning
     parser.add_argument(
-        '--center_frac',
+        '--crop_frac',
         type=float,
-        default=0.25,
-        help='Half-size of the center window as W/H fraction for divider picking (default: 0.25)'
+        default=0.05,
+        help='Fraction of image width to search for gutter (default: 0.05)'
     )
     parser.add_argument(
-        '--divider_min_conf',
+        '--gutter_frac',
         type=float,
-        default=0.0,
-        help='Minimum confidence for divider candidates (default: 0.0)'
+        default=0.005,
+        help='Gutter width as fraction of image width (default: 0.005)'
     )
     parser.add_argument(
-        '--divider_class',
+        '--blur_ksize',
         type=int,
-        default=None,
-        help='Restrict divider to a specific class id (default: None = any class)'
+        default=5,
+        help='Kernel size for Gaussian blur (default: 5)'
     )
     return parser.parse_args()
 
@@ -361,7 +325,7 @@ def main():
     device = get_device(args.gpu_id)
     logging.info(f"Using device: {device}")
 
-    det_model, divider_model = load_models(args.checkpoint, args.divider_checkpoint, device)
+    model = load_model(args.checkpoint, device)
 
     # Load already processed list (if any)
     results_json = args.output_dir / 'results.json'
@@ -393,19 +357,19 @@ def main():
     if args.batch == 1:
         for img_path in paths:
             try:
-                result = det_model.predict(str(img_path), verbose=False)[0]
+                result = model.predict(str(img_path), verbose=False)[0]
                 out = detect_layout(
                     img_path, result, args.output_dir,
-                    divider_model,
-                    args.center_frac, args.divider_min_conf, args.divider_class
+                    args.crop_frac, args.gutter_frac, args.blur_ksize
                 )
                 logging.info(f"Processed {img_path}: {out}")
             except Exception as e:
                 logging.error(f"Error processing {img_path}: {e}")
     else:
+        # batch inference
         sources = [str(p) for p in paths]
         try:
-            batch_results = det_model.predict(
+            batch_results = model.predict(
                 sources,
                 batch=args.batch,
                 verbose=False
@@ -413,8 +377,7 @@ def main():
             for img_path, result in zip(paths, batch_results):
                 out = detect_layout(
                     img_path, result, args.output_dir,
-                    divider_model,
-                    args.center_frac, args.divider_min_conf, args.divider_class
+                    args.crop_frac, args.gutter_frac, args.blur_ksize
                 )
                 logging.info(f"Processed {img_path}: {out}")
         except Exception as e:
