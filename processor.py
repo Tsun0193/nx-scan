@@ -127,7 +127,10 @@ def divider_with_yolo(
 ) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
     """Return (mid, pick_dict). mid is x-center of chosen divider box in CROPPED coords."""
     H, W = img_rgb.shape[:2]
-    res = divider_model.predict(img_rgb, verbose=False)[0]
+    res = divider_model.predict(img_rgb, 
+                                conf=0.001,
+                                iou=0.9,
+                                verbose=False)[0]
     pick = pick_center_box(res, img_w=W, img_h=H, center_frac=center_frac,
                            min_conf=min_conf, class_id=class_id)
     if pick is None:
