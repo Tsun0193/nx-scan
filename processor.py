@@ -272,6 +272,11 @@ def detect_layout(
     else:
         max_idx = int(confs.argmax())
         x1, y1, x2, y2 = map(int, boxes[max_idx])
+
+        expand = int(0.02 * W)
+        x1 = max(0, x1 - expand)
+        x2 = min(W, x2 + expand)
+        
         det_xyxy = [int(x1), int(y1), int(x2), int(y2)]
         det_conf = float(confs[max_idx])
         det_cls  = int(result.boxes.cls.cpu().numpy()[max_idx])
