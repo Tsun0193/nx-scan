@@ -273,14 +273,17 @@ def detect_layout(
         max_idx = int(confs.argmax())
         x1, y1, x2, y2 = map(int, boxes[max_idx])
 
-        expand = int(0.02 * W)
-        x1 = max(0, x1 - expand)
-        x2 = min(W, x2 + expand)
+        expand_w = int(0.02 * W)
+        expand_h = int(0.02 * H)
+        x1 = max(0, x1 - expand_w)
+        x2 = min(W, x2 + expand_w)
+        y1 = max(0, y1 - expand_h)
         
         det_xyxy = [int(x1), int(y1), int(x2), int(y2)]
         det_conf = float(confs[max_idx])
         det_cls  = int(result.boxes.cls.cpu().numpy()[max_idx])
         det_name = names.get(det_cls)
+        
         cropped = img_rgb[y1:y2, x1:x2]
 
     ch, cw = cropped.shape[:2]
